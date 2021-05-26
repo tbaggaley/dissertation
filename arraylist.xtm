@@ -1,0 +1,109 @@
+;; Simple "ArrayList"-like data structure
+;; per Java behaviour - essentially an array (scheme vector)
+;; with contiguous elements and ability to index in constant time
+;; but handles sizing dynamically, resizing if required
+;;
+;; this implementation does not conserve order to allow it to
+;; "fill in gaps"
+;; new elements are placed into spaces left by deleting old elements
+;; to prevent wasting memory
+;;
+;; Author: Thomas Baggaley <baggaleyto@cardiff.ac.uk>
+
+;; From utils.xtm uses list-copy, vector-copy
+(sys:load "tom/utils.xtm")
+
+(define (array-list:new . size)
+  (let ((size (if (null? size)
+                64
+                (car size))))
+    (cons (cons '() 0) (make-vector size))))
+
+(define array-list:holes caar)
+(define array-list:write-position cdar)
+(define array-list:data cdr)
+
+(define (array-list:set! array-list index data)
+  (vector-set! (array-list:data array-list) index data))
+
+(define (array-list:get array-list index)
+  (vector-ref (array-list:data array-list) index))
+(define array-list:ref array-list:get)
+(define (array-list:length array-list)
+  (vector-length (array-list:data array-list)))
+(define (set-caar! lst data)
+  (set-car! (car lst) data))
+(define (set-cdar! lst data)
+  (set-cdr! (car lst) data))
+(define array-list:set-holes! set-caar!)
+(define array-list:set-write-position! set-cdar!)
+(define array-list:set-data! set-cdr!)
+
+(define (array-list:full? array-list)
+  (>= (array-list:write-position array-list) (array-list:length array-list)))
+
+(define (array-list:empty? array-list)
+  (= (array-list:write-position array-list) 0))
+
+(define (array-list:copy array-list new-size)
+  (cons (cons (list-copy (array-list:holes array-list)) (array-list:write-position array-list))
+        (vector-copy (array-list:data array-list) new-size)))
+
+(define (array-list:add! array-list item)
+  (if (array-list:full? array-list)
+    ;; Need to expand array list to add new element
+    ;; We'll double the size by default
+    (let ((new-vector (vector-copy (array-list:data array-list) (* 2 (array-list:length array-list)))))
+      (array-list:set-data! array-list new-vector)
+      (array-list:add! array-list item))
+    (begin
+      (if (null? (array-list:holes array-list))
+        ;; Have to append to end of array...
+        (let find-space-loop ((unused '()))       ;; extempore's scheme interpreter necessitates vars
+          (if (null? (array-list:get array-list (array-list:write-position array-list)))
+            (begin
+              (array-list:set! array-list
+                               (array-list:write-position array-list)
+                               item)
+              (array-list:set-write-position! array-list (+ 1 (array-list:write-position array-list)))
+              (- (array-list:write-position array-list) 1)) ;; Return index of new item
+            (begin
+              (array-list:set-write-position! array-list (+ 1 (array-list:write-position array-list)))
+              (find-space-loop))))
+        ;; If holes are known, we can use those instead
+        (let ((new-index (car (array-list:holes array-list))))
+          (array-list:set! array-list new-index item)
+          (array-list:set-holes! array-list (cdr (array-list:holes array-list)))
+          new-index))))) ;; Return index of new item)))))
+
+(define (array-list:remove! array-list index)
+  (array-list:set! array-list index '())
+  (array-list:set-holes! array-list (cons index (array-list:holes array-list))))
+
+;; Tests!
+
+(sys:load "tom/test.xtm")
+
+(test:define-tests
+  'array-list
+  array-list <- (array-list:new 64)
+  (array-list:empty? array-list) -> #t
+  (array-list:full? array-list) -> #f
+  (array-list:length array-list) -> 64
+  (array-list:get array-list 0) -> '()
+  _ <- (array-list:set! array-list 3 42)
+  (array-list:get array-list 3) -> 42
+  (array-list:add! array-list 1) -> 0
+  (array-list:get array-list 0) -> 1
+  (array-list:write-position array-list) -> 1
+  _ <- (array-list:remove! array-list 3)
+  (length (array-list:holes array-list)) -> 1
+  (array-list:get array-list 3) -> '()
+  _ <- (array-list:add! array-list 64)
+  (array-list:get array-list 3) -> 64
+  _ <- (array-list:set-write-position! array-list (array-list:length array-list))
+  ; Check array list expands appropriately
+  _ <- (array-list:add! array-list 1337)
+  (> (array-list:length array-list) 64) -> #t)
+  
+(test:run-tests 'array-list)

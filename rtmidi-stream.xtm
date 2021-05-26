@@ -1,0 +1,286 @@
+; Load Ben Swift's rtmidi XTLang wrapper definitions
+(sys:load "libs/contrib/rtmidi.xtm")
+(sys:load "tom/async-stream.xtm")
+(sys:load "tom/arraylist.xtm")
+
+(sys:load-preload-check 'tom/rtmidi-stream)
+(define *xtmlib-tom/rtmidi-stream-loaded* #t)
+
+; Code to provide ability to query available APIs
+; NB. extempore-shipped librtmidi is only compiled w/ support for ALSA
+; Deleting the librtmidi in the platform-shlibs folder will use system library
+; and therefore allow use of JACK, if applicable
+
+(bind-val rtmidi_api_array i32* (halloc RTMIDI_API_NUM))
+(bind-val rtmidi_api_count i32 0) 
+
+(bind-func rtmidi_query_apis
+  (lambda ()
+    (set! rtmidi_api_count (rtmidi_get_compiled_api rtmidi_api_array RTMIDI_API_NUM))))
+
+; rtmidi-list-apis:
+; Scheme wrapper to get a list of available rtmidi API names & IDs
+
+(define rtmidi-list-apis
+  (let ((cache '()))
+    (lambda ()
+      (if (null? cache)
+        (begin
+          (rtmidi_query_apis)
+          (set! cache (let ((api-count ($ rtmidi_api_count)))
+                        (letrec ((iter (lambda (index)
+                                         (let* ((api-number (eval `($ (pref rtmidi_api_array ,index))))
+                                                (api-name (eval `($ (String (rtmidi_api_name ,api-number))))))
+                                           (cons (cons api-number api-name) (if (< index (- api-count 1))
+                                                                              (iter (+ index 1))
+                                                                              '()))))))
+                          (iter 0))))))
+      cache)))
+
+; Is JACK supported?
+(define rtmidi-jack-support?
+  (assoc 3 (rtmidi-list-apis)))
+
+; Helpers to open virtual ports
+(bind-func make-rtmidi-in-port
+  (lambda (portname api)
+    (let ((in (rtmidi_in_create api portname 128)))
+      (rtmidi_open_virtual_port in "MIDI Input")
+      in)))
+
+(bind-func make-rtmidi-out-port
+  (lambda (portname api)
+    (let ((out (rtmidi_out_create api portname)))
+      (rtmidi_open_virtual_port out "MIDI Output")
+      out)))
+
+;; As per rtmidi_c.h
+(define RTMIDI_API_LINUX_ALSA 2)
+(define RTMIDI_API_UNIX_JACK 3)
+
+; Simple scheme interface to create a virtual MIDI port
+; Will use JACK if support available, otherwise ALSA
+
+(define (midi:create-port direction portname)
+  ((if (eq? direction 'in)
+     make-rtmidi-in-port 
+     make-rtmidi-out-port) portname (if rtmidi-jack-support? RTMIDI_API_UNIX_JACK RTMIDI_API_LINUX_ALSA)))
+
+;; NB. Sadly rtmidi creates a new JACK (or ALSA) client for each call to rtmidi_in_create
+;; leading to cluttering of the JACK graph... Have to live with this for now
+;; It will remain an issue unless libjack is used directly or rtmidi modified
+
+;; midi:port->stream: input-port -> stream
+;; 
+;; Starts Scheme poll loop for MIDI events arriving at input-port
+;; feeds these events into an asynchronous stream, which may be interacted with using the methods in
+;; async-stream.xtm
+;;
+;; Returns the new stream
+
+;; XTLang values / procedures used for passing data across the IPC divide
+;; (since Extempore won't serialise pointers)
+(bind-val midi_current_device_mutex i8* (mutex_create))
+(bind-val midi_current_device_ptr i8* 0)
+(bind-func set_midi_current_device_ptr (lambda (value) (set! midi_current_device_ptr value)))
+(bind-func get_midi_current_device_ptr (lambda () midi_current_device_ptr))
+
+(define (midi:input-port->stream input-port)
+  (let*
+    ((output-stream (stream:new))
+     (stream-ref (array-list:add! midi:stream-refs output-stream)))
+    ;; Guard XTLang IPC with a mutex for thread safety
+    ($ (mutex_lock midi_current_device_mutex))
+    (set_midi_current_device_ptr input-port)
+    (ipc:call "midi-poller" 'register-device stream-ref)
+    ($ (mutex_unlock midi_current_device_mutex))
+    output-stream))
+
+(define (midi:output-port->stream output-port)
+  (let ((input-stream (stream:new)))
+    (stream:for-each (lambda event-data
+                       (apply midi:send output-port event-data))
+                     input-stream)
+    input-stream))
+
+;; Allow use of rtmidi_close_port library function from Scheme code
+;; (defining the xtlang function auto-generates the Scheme wrapper)
+(bind-func rtmidi_close_input
+  (lambda (device:RtMidiInPtr)
+    (rtmidi_close_port device)))
+
+(bind-func rtmidi_close_output
+  (lambda (device:RtMidiOutPtr)
+    (rtmidi_close_port device)))
+
+;; Scheme-style naming for the above
+(define midi:close-input-port rtmidi_close_input)
+(define midi:close-output-port rtmidi_close_output)
+
+;; Polling loop code
+;; -----------------
+;; Use poll loop -> since even if we use the rtmidi callbacks
+;; we'd still need to write a scheme poll loop to interact with midi events
+;; from scheme. this way is therefore more direct
+
+(bind-val rtmidi_message i8* (alloc 3))
+(define rtmidi_message ($$ rtmidi_message))     ;; Access opaque pointer from Scheme
+(bind-func rtmidi_get_message_global (lambda () rtmidi_message))
+
+;; Get next message in MIDI queue
+;; Returns length of message (number of bytes read)
+
+(bind-func rtmidi_get_msg
+  (let ((message_len:i64* (alloc)))
+    (lambda (device:RtMidiInPtr)
+      (pset! message_len 0 3)   ;; Used to pass rtmidi the size of our message buffer (3 bytes)
+      (rtmidi_in_get_message device rtmidi_message message_len)
+      (pref message_len 0))))   ;; Return amounts of bytes read (filled by rtmidi)
+
+
+;; Accessors for Scheme code to call given opaque message pointer
+;; Bitwise logic as per rtmidi.xtm library code
+(bind-func msg_type:[i8,i8*]*
+  (lambda (msg:i8*) (>> (pref msg 0) 4)))
+(bind-func msg_chan:[i8,i8*]*
+  (lambda (msg:i8*) (& (pref msg 0) 15)))
+(bind-func msg_a:[i8,i8*]*
+  (lambda (msg:i8*) (pref msg 1)))
+(bind-func msg_b:[i8,i8*]*
+  (lambda (msg:i8*) (pref msg 2)))
+
+;; Scheme polling loop - used by midi-poller thread
+;; Callback closures contain stream reference state
+;; and communicate back with primary thread when events come in
+;; This allows high-frequency polling without hogging compute capacity
+;; from other Scheme tasks using the scheduler (as they can continue in another thread)
+
+(define (rtmidi-scheme-poll-loop device stream-id)
+  (if (null? deregistration-notices)
+    (let ((len (rtmidi_get_msg device))
+          (msg (rtmidi_get_message_global)))
+      (if (= len 0)
+        (callback (now) rtmidi-scheme-poll-loop device stream-id)  ;; Check for events ASAP
+        (let ((type (msg_type msg))
+              (chan (msg_chan msg))
+              (a (msg_a msg))
+              (b (msg_b msg)))
+          (ipc:call-async "primary" 'midi:handle-event stream-id type chan a b)
+          (rtmidi-scheme-poll-loop device stream-id))))
+    (if (not (member device deregistration-notices))
+      (callback (now) rtmidi-scheme-poll-loop device stream-id)))) ;; Let other devices be processed until deregistration is handled
+
+(define midi_send rtmidi_send)
+(define midi-send midi_send)
+(define midi:send midi-send)
+
+;; Start threaded implementation
+
+;; Start midi event polling thread
+(ipc:new "midi-poller" 1337)
+
+;; Keep track of stream references (since we can't pass closures via IPC)
+(define midi:stream-refs (array-list:new 16))
+
+;; Define Scheme callback function in polling thread
+(ipc:define "midi-poller" 'rtmidi-scheme-poll-loop rtmidi-scheme-poll-loop)
+
+;; Define xtlang wrappers in polling process
+(for-each (lambda (name) (ipc:bind-func "midi-poller" name))
+          (list 'get_midi_current_device_ptr 'rtmidi_get_message_global 'rtmidi_get_msg
+                'msg_type 'msg_chan 'msg_a 'msg_b))
+
+;; Define message-handling functions for polling thread
+;; NB. Device pointer passed through xtlang (not thread safe - but fine given present usage scenarios)
+;; as extempore refuses to serialise cptrs for IPC
+(ipc:define "midi-poller" 'register-device
+            (lambda (stream-id)
+              (rtmidi-scheme-poll-loop (get_midi_current_device_ptr)
+                                       stream-id)))
+                                         ;; Phone home with event details
+
+;; Provide means to de-register devices via a message queue (dereg notices)
+(ipc:define "midi-poller" 'deregistration-notices '())
+(ipc:define "midi-poller" 'deregister-device
+            (lambda (device-ptr)
+              (set! deregistration-notices (cons device-ptr deregistration-notices))))
+
+;; Define handler for incoming events from polling thread
+(define (midi:handle-event stream-id type chan a b)
+  (stream:send (array-list:get midi:stream-refs stream-id) type chan a b))
+
+;; Alias some useful functions in contib/rtmidi-scm.xtm
+
+(define midi:play-note play-midi-note)
+
+;; A helper function for binding functions to midi control change events
+
+(define-macro (midi:on-cc input-stream channel controller . function-expr)
+  (let ((fn_name (string->symbol (string-append "cc_callback_" (number->string channel) "_" (number->string controller)))))
+    `(begin
+       (stream:remove-callback! ,input-stream (quote ,fn_name))
+       (define ,fn_name (lambda (type chan a @1)
+                          (if (and (= type *midi-cc*)
+                                   (= chan ,channel)
+                                   (= a ,controller))
+                            (begin ,@function-expr))))
+       (stream:register-callback! ,input-stream (quote ,fn_name)))))
+
+;; midi:reset-output device -> void
+;; Set all notes to off on output device
+;; Useful to reset output if notes get "stuck" on for whatever reason
+
+(define (midi:reset-output device)
+  (dotimes (channel 15)
+    (dotimes (note 127)
+      (midi:send device *midi-note-off* channel note 0))))
+
+;; Helper macro for binding events to specific key presses
+;; Useful for non-note input on MIDI controllers, e.g. pads
+
+(define-macro (midi:on-keypress input-stream channel note . function-expr)
+  (let ((fn_name (string->symbol (string-append "key_callback_" (number->string channel) "_" (number->string note)))))
+    `(begin
+       (stream:remove-callback! ,input-stream (quote ,fn_name))
+       (define ,fn_name (lambda (type chan a b)
+                          (if (and (= type *midi-note-on*)
+                                   (= chan ,channel)
+                                   (= a ,note))
+                            (begin ,@function-expr))))
+       (stream:register-callback! ,input-stream (quote ,fn_name)))))
+
+;; Re-include some standard library functions
+;; The below is taken from Sorensen's portmidi wrapper
+;; Useful for use in pattern language
+;; Included here so that everything is in one place
+
+(define *midioffset* 0)
+
+(define-macro (mplay . args)
+  (if (symbol? (car args))
+    `(if (list? ,(cadr args))
+       (map (lambda (p)
+              (play-midi-note (+ (*metro* beat) *midioffset*) ,(car args)
+                              (real->integer p)
+                              (real->integer ,(caddr args))
+                              (*metro* 'dur ,(car (cdddr args)))
+                              (real->integer , (car (cddddr args)))))
+            ,(cadr args))
+       (play-midi-note (+ (*metro* beat) *midioffset*) ,(car args)
+                       (real->integer ,(cadr args))
+                       (real->integer ,(caddr args))
+                       (*metro* 'dur ,(car (cdddr args)))
+                       (real->integer , (car (cddddr args)))))
+    `(if (list? ,(caddr args))
+       (map (lambda (p)
+              (play-midi-note (+ (*metro* (+ beat ,(car args))) *midioffset*) ,(cadr args)
+                              (real->integer p)
+                              (real->integer ,(car (cdddr args)))
+                              (*metro* 'dur ,(cadr (cdddr args)))
+                              (real->integer , (cadr (cddddr args)))))
+            ,(caddr args))
+       (play-midi-note (+ (*metro* (+ beat ,(car args))) *midioffset*) ,(cadr args)
+                       (real->integer ,(caddr args))
+                       (real->integer ,(car (cdddr args)))
+                       (*metro* 'dur ,(cadr (cdddr args)))
+                       (real->integer , (cadr (cddddr args)))))))

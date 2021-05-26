@@ -1,0 +1,234 @@
+;; This file is a scratchpad used throughout the project for testing
+;; and demonstrating behaviour - included to give some examples of usage
+;; Intended and written for interactive evaluation, may not be linear
+
+(sys:load "./examples/sharedsystem/audiosetup.xtm")
+(sys:load "tom/utils.xtm")
+(sys:load "tom/rtmidi-stream.xtm")
+(sys:load "tom/recording.xtm")
+(sys:load "tom/apckey25.xtm")
+
+;; Open some MIDI ports
+(define keyboard-in (midi:create-port 'in "Extempore Keyboard Input"))
+
+(:| infinity-saxophone 20 0 (mplay midi-out @1 120 dur 3)
+    `(c5 d5 eb5 | | | | _ c5 d5 | | | | _ d5 | | | | _ bb4 c5 | | | | _))
+
+;; Set up a basic arpeggiator using the built-in pattern language
+(define keyboard-stream (midi:input-port->stream
+                          (midi:create-port 'in "Keyboard Input")))
+(define midi-out (midi:create-port 'out "Extempore MIDI Output"))
+
+;; Create a 'holder' to keep state regarding keys currently depressed
+(define keyboard-holder (holder:new keyboard-stream))
+
+;; Simplest possible arpeggiated pattern - plays notes in order pushed
+(:| simple-arppegiator 2 0 (mplay midi-out @1 80 dur 0)
+    (holder:get-notes keyboard-holder))
+
+(define output-stream (stream:new))
+(stream:for-each (lambda args (apply midi:send midi-out args)) output-stream)
+(stream:purge-callbacks! output-stream)
+(stream:purge-callbacks! keyboard-stream)
+
+(stream:send output-stream *midi-note-off* 0 67 100)
+
+(define looper (apc25:setup-looper 2 keyboard-stream output-stream 1))
+(define looper2 (apc25:setup-looper 1 keyboard-stream output-stream 1))
+(define looper3 (apc25:setup-looper 0 keyboard-stream output-stream 2))
+
+(println (recorder->pattern-expr (looper 'get-recorder)))
+
+(:| _pattern_name_ 8 0 (mplay midi-out @1 80 dur 0) (quote (60 | | | | _ _ _ 60 | | | | _ _ _ _ 57 | | | | _ _ 64 | | | | _ _ _ _ 62 | | | | | _ _ _ _ _ _ _ _ _ 59 | | | | | _ _ _ _ _ _ _ _ _ _ 60 | | | | _ _ _ 60 | | | | _ _ _ 57 | | | _ _ _ _ 64 | | | | _ _ _ 62 | | | | _ _ _ _ _ _ _ _ _ 60 | | | | | _ _ _ _ _ _ _ _ _ _ _ _)))
+
+(define rec (looper3 'get-recorder))
+
+(println (recorder:get-events (looper 'get-recorder)))
+
+;; Forward all events from arp-stream straight to midi-out
+;; (so we can hear notes played as we record)
+(define (passthrough) (lambda args (apply midi:send midi-out args)))
+(stream:for-each 'passthrough arp-stream)
+
+(stream:send arp-stream *midi-note-on* 1 60 127)
+
+(stream:purge-callbacks! output-stream)
+
+(:| arp1 1 0 (mplay midi-out @1 100 (* 2 dur) 0)
+    (map (lambda (note)
+           (+ note 12))
+         (take (looper:get-held-notes looper) 4)))
+
+(:| arp2 2 0 (mplay midi-out @1 60 (* 0.5 dur) 0)
+    (take (looper:get-held-notes looper) 4))
+
+(:| arp3 2 0 (mplay midi-out @1 100 dur 0)
+    (let ((notes (looper:get-held-notes looper)))
+      (list 
+        notes
+        (map (lambda (note) (- note 12)) notes))))
+
+(:> drum 1 0 (play kit @1 100 dur) '(60))
+
+;; View midi events as they come in
+(stream:for-each println keyboard-stream)
+
+(stream:for-each (lambda (type chan note velocity)
+                   (cond ((eqv? type *midi-note-on*)
+                          (println 'note note 'pressed 'at (now) 'beat (*metro* 'beat-at-time (now))))
+                         ((eqv? type *midi-note-off*)
+                          (println 'note note 'released 'at (now) 'beat (*metro* 'beat-at-time (now))))))
+                 keyboard-stream)
+
+(println (holder:get-notes holder))
+
+;; Most basic possible pattern language arpeggiator
+(:| pattern-lang-arp 1 0 (mplay midi-out @1 80 (* 2 dur) 1)
+    (holder:get-notes holder))
+
+;; Play a set of held notes up and down
+
+(:> up-down-arp 1 0 (mplay midi-out @1 80 (* 2 dur) 1)
+    (let ((held-notes (looper:get-held-notes looper)))
+      (list
+        held-notes
+        (reverse held-notes))))
+
+;; Use "take" to ensure pattern list is always the same length (duplicating notes if needed)
+;; to avoid undesirable changing of note duration as lists lengthen/shorten
+;; (such is behaviour of built-in pattern language)
+
+(:> octave-up-down-arp 8 0 (mplay midi-out @1 80 (* 20 dur) 0)
+    (let* ((held-notes (reverse (take (holder:get-notes keyboard-holder) 8)))
+           (held-notes^12 (map (lambda (x) (+ x 12)) held-notes)))
+      `(,@held-notes
+         ,@held-notes^12
+         ,@(reverse held-notes^12)
+         ,@(reverse held-notes))))
+
+;; Another example using pattern-language
+;; LHHLLHH chord pattern
+;; Hold C Eb F for the eminence front ostinato
+
+;; Reset all callbacks
+(stream:purge-callbacks! keyboard-stream)
+
+;; Bind top-left APC25 control dial to duration-scale-factor variable
+;; Provides trancegate-like effect when dialled down (albeit with very regular rythm)
+
+(define duration-scale-factor 1.0)
+(midi:on-cc keyboard-stream 48 (lambda (value) (set! duration-scale-factor (/ (+ 1 (* 2 value)) 127))))
+(midi:on-cc keyboard-stream 49 (lambda (value) (*metro* 'set-tempo (* value 2))))
+(println duration-scale-factor)
+
+(:| eminence 1 0 (mplay midi-out @1 80 (* duration-scale-factor dur) 1)
+    (let*
+      ((held-notes (holder:get-notes holder))
+       (chord-low (list->vector held-notes))
+       (chord-high (list->vector (map (lambda (n) (+ n 12)) held-notes))))
+      (list chord-low
+            chord-high
+            chord-high
+            chord-low)))
+
+;; Test recording functionality
+;; per "recording.xtm"
+
+;; Steps for macro to do will be:
+
+(*metro* 'set-tempo 120)
+
+;; Create recorder
+(define myrec (recorder:new))
+(stream:purge-callbacks! keyboard-stream)
+
+;; Start recorder recording and simultaneously route events
+;; straight to output stream while recording continues
+(recorder:set-input-stream! myrec keyboard-stream)
+(recorder:start-recording! myrec)
+
+(define (myrec_passthrough type chan a b)
+  (stream:send output-stream type chan a b))
+(stream:register-callback! myrec_passthrough input-stream)
+
+(recorder:stop-recording! myrec)
+
+;; Deregister passthrough callback
+(stream:remove-callback! input-stream myrec_passthrough)
+
+;; Play output events to output stream
+(stream:register-callback! (recorder:playback-stream myrec)
+                           (lambda (type chan a b)
+                             (stream:send output-stream type chan a b)))
+
+(:| test-pattern-expr 0
+    (mplay midi-out @1 40 (* 3 dur) 6)
+    pattern-list)
+
+(:| kick-drum 1 0 (play kit @1 50 dur) '(60))
+(:| hihi 1 0.5 (play kit @1 50 dur) '(40))
+
+(println (recorder:get-events myrec))
+(println (recorder->pattern-expr myrec))
+(eval (recorder->pattern-expr myrec))
+(*metro* 'beat-at-time (now))
+(length pattern-list)
+
+(define pattern-list (event-list->pattern-list (recorder:get-events myrec) 16))
+
+(println pattern-list)
+(println (length pattern-list))
+(define events (recorder:get-events myrec))
+(define note-duration (event-list->note-duration-list events))
+(define beat-pairs (time-note-duration->beat-note-pair note-duration 5))
+
+(println events)
+(println note-duration)
+(println beat-pairs)
+(now)
+(> (now) (get-next-beat-time))
+(get-next-beat-time)
+(*metro* 'get-beat)
+
+;; Looks like the issue is with the metronome?
+
+
+
+;; Stop when button pushed again
+(recorder:stop! myrec)
+
+;; Test looping code
+
+;; First need to set up an output stream
+;; which sends events to output midi device when triggered
+
+(define output-stream (stream:new))
+(stream:for-each (lambda args (apply midi:send midi-out args)) output-stream)
+
+(define looper-test (looper:create keyboard-stream output-stream 0))
+(apc25:on-keypress keyboard-stream 1 
+                   (begin
+                     (looper:trigger looper-test)
+                     (let ((status (looper:status looper-test)))
+                       (cond ((eq? status 'idle)
+                              (apc25:set-light! 1 *apc-amber-solid*))
+                             ((eq? status 'recording)
+                              (apc25:set-light! 1 *apc-red-solid*))
+                             ((eq? status 'playing)
+                              (apc25:set-light! 1 *apc-green-solid*))))))
+
+(apc25:setup-looper 0 keyboard-stream output-stream 0)
+(apc25:setup-looper 1 keyboard-stream output-stream 0)
+(apc25:setup-looper 2 keyboard-stream output-stream 0)
+(apc25:setup-looper 3 keyboard-stream output-stream 0)
+
+;; Probably want to experiment with feeding loopers into arpeggiator patterns
+;; using pattern language
+;; will probably sound better since pattern language will essentially fore
+;; everything to run on the beat in a nice way
+
+(sys:load "tom/rtmidi-stream.xtm")
+(define midi-in (midi:create-port 'in "Extempore input"))
+(define midi-out (midi:create-port 'out "Extempore output"))
+
+;; Test

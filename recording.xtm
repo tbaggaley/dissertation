@@ -1,0 +1,382 @@
+(sys:load "tom/utils.xtm")
+(sys:load "tom/quantise.xtm")
+
+;; Holders
+;; a way to keep track of which notes are held down
+;; based on a given midi stream
+;; useful for arpeggiators (esp. using the pattern language)
+
+(define (holder:new . input-stream)
+  (let* ((held-notes (make-vector 128))
+         (stream #f)
+         (callback-fn (lambda (type channel note velocity)
+                        (cond ((= type *midi-note-on*)
+                               (vector-set! held-notes note velocity))
+                              ((= type *midi-note-off*)
+                               (vector-set! held-notes note '())))))
+         (note-vector->list (lambda (notes-vector)
+                              (let loop ((i 127)
+                                         (notes-list '()))
+                                (if (< i 0)
+                                  notes-list
+                                  (loop (- i 1)
+                                        (if (null? (vector-ref notes-vector i))
+                                          notes-list
+                                          (cons i notes-list))))))))
+    (letrec ((this (lambda (command . args)
+                     (cond ((eq? command 'set-input-stream!)
+                            (if stream
+                              (stream:remove-callback! stream callback-fn))
+                            (set! stream (car args))
+                            (if stream
+                              (stream:register-callback! stream callback-fn)))
+                           ((eq? command 'get-notes)
+                            (note-vector->list held-notes))
+                           ((eq? command 'purge-notes!)
+                            (set! held-notes (make-vector 128)))
+                           (else
+                             (println 'holder:new/lambda: 'unknown 'command command))))))
+      ;; Take an optional input-stream argument in constructor -> register
+      ;; this stream as input stream immediately if present
+      (if (not (null? input-stream))
+        (holder:set-input-stream! this (car input-stream)))
+      this)))
+
+(define (holder:set-input-stream! holder stream)
+  (holder 'set-input-stream! stream))
+(define (holder:get-notes holder)
+  (holder 'get-notes))
+(define (holder:purge-notes! holder notes)
+  (holder 'purge-notes! notes))
+
+;; Work on midi recording functionality
+
+;; Implement linked lists w/ access to last elem for fast appending
+;; (Otherwise would have to reverse whole list)
+
+;; Recorders
+;; record incoming midi events & times into internal state
+;; provide a means to play back these events via stream interface
+;; potentially indefinitely (looping)
+;; optional -> quantisation
+
+(define (recorder:new)
+  (let* ((events-list (list-builder:new))
+         (stream #f)
+         (quantisation-precision 1/16)
+         (playback-active #f)
+         (callback-fn (lambda midi-event
+                        (let ((quantised-time (time-quantise (now) quantisation-precision)))
+                          (list-builder:append! events-list (list (cons quantised-time midi-event))))))
+         (normalize-times (lambda ()
+                            (let ((first-time (caar (list-builder:head events-list))))
+                              (list-builder:map! (lambda (event)
+                                                   (cons (- (car event) first-time)
+                                                         (cdr event)))
+                                                 events-list))))
+         (playback-stream (stream:new)))
+    ;; NB. playback-function schedules relative to prev absolute time in samples now, instead of using
+    ;; (now) - see Extempore temporal recursion docs/notes - this avoids execution time pushing the
+    ;; pattern out of sync as it accumulates
+    (letrec ((playback-function (lambda (start-time remaining-events)
+                                  (if playback-active
+                                    (let* ((event (car remaining-events))
+                                           (event-details (cdr event))
+                                           (event-time (car event)))
+                                      (apply stream:send playback-stream event-details)
+                                      (if (null? (cdr remaining-events))
+                                        (let ((next-beat (get-next-beat-time)))
+                                          (callback next-beat playback-function next-beat (list-builder:head events-list)))
+                                        (callback (+ start-time (caadr remaining-events)) playback-function start-time (cdr remaining-events))))))))
+
+      (lambda (command . args)
+        (cond ((eq? command 'set-input-stream!)
+               (if stream
+                 (stream:remove-callback! stream callback-fn))
+               (set! stream (car args))
+               (if stream
+                 (stream:remove-callback! stream callback-fn))) ;; Prevent recording same stream events twice
+              ((eq? command 'get-input-stream)
+               stream)
+              ((eq? command 'set-precision!)
+               (set! quantisation-precision (car args)))
+              ((eq? command 'get-precision)
+               quantisation-precision)
+              ((eq? command 'start-recording!)
+               (set! events-list (list-builder:new))
+               (stream:register-callback! stream callback-fn))
+              ((eq? command 'stop-recording!)
+               (stream:remove-callback! stream callback-fn)
+               ;; Add "dummy events" to generate correct spacing between last + first recorded events
+               ;; First dummy event is synchronized with beat prior to start of pattern
+               ;; This ensures that first 
+               (let ((dummy-event '(0 0 0 0)))
+                 (list-builder:append-head! events-list (cons (get-first-beat-before (caar (list-builder:head events-list)))
+                                                                dummy-event))
+                 (list-builder:append! events-list (list (cons (get-next-beat-time) '(0 0 0 0)))))
+               ;; Now normalize the recorded times so they start at zero
+               (normalize-times))
+              ((eq? command 'get-events)
+               (list-builder:head events-list))
+              ((eq? command 'get-playback-stream)
+               playback-stream)
+              ((eq? command 'start-playback!)
+               (set! playback-active #t)
+               (let ((next-beat (get-next-beat-time)))
+                 (callback next-beat playback-function next-beat (list-builder:head events-list))))
+              ((eq? command 'stop-playback!)
+               (set! playback-active #f))
+              (else
+                (println 'recorder:new/lambda 'unknown 'command command)))))))
+
+(define (recorder:set-input-stream! recorder stream)
+  (recorder 'set-input-stream! stream))
+(define (recorder:set-precision! recorder quantisation-precision)
+  (recorder 'set-precision! quantisation-precision))
+(define (recorder:get-precision recorder)
+  (recorder 'get-precision))
+(define (recorder:get-input-stream recorder)
+  (recorder 'get-input-stream))
+(define (recorder:get-events recorder)
+  (recorder 'get-events))
+(define (recorder:play! recorder)
+  (recorder 'start-playback!))
+(define (recorder:stop! recorder)
+  (recorder 'stop-playback!))
+(define (recorder:playback-stream recorder)
+  (recorder 'get-playback-stream))
+(define recorder:get-playback-stream
+  recorder:playback-stream)
+(define (recorder:start-recording! recorder)
+  (recorder 'start-recording!))
+(define (recorder:stop-recording! recorder)
+  (recorder 'stop-recording!))
+
+;; Basic looping functionality for use with arpeggiators etc.
+;; Returns a stream containing the looped MIDI events
+;; 
+
+(define (looper:new input-stream output-stream output-channel)
+  (let ((recorder (recorder:new))
+        (holder (holder:new))
+        (status 'empty)
+        (passthrough (lambda (type chan a b)
+                       (stream:send output-stream type output-channel a b))))
+    ;; Set up recorder & holder closures
+    (recorder:set-input-stream! recorder input-stream)
+    (stream:register-callback! (recorder:get-playback-stream recorder) passthrough)
+    ;; Return dispatcher lambda
+    (lambda (command . args)
+      (cond ((eq? command 'trigger)
+             ; On trigger, the looper is started if stopped or stopped if started...
+             (cond ((eq? status 'empty)
+                    (set! status 'recording)
+                    (holder:set-input-stream! holder input-stream)
+                    (stream:register-callback! input-stream passthrough)
+                    (recorder:start-recording! recorder))
+                   ((eq? status 'recording)
+                    ;; Recording finished
+                    (if (null? (recorder:get-events recorder))
+                      (set! status 'empty)
+                      (begin
+                        (set! status 'playing)
+                        (stream:remove-callback! input-stream passthrough)
+                        (holder:set-input-stream! holder (recorder:get-playback-stream recorder))
+                        (recorder:stop-recording! recorder)
+                        (recorder:play! recorder))))
+                   ((eq? status 'playing)
+                    ;; Stop playback
+                    (set! status 'stopped)
+                    (recorder:stop! recorder)
+                    ;; Clear notes from holder - useful when used with arpeggiators/pattern lang. etc.
+                    (holder:purge-notes! holder))
+                   ((eq? status 'stopped)
+                    (set! status 'playing)
+                    (recorder:play! recorder))))
+            ((eq? command 'get-recorder)
+             recorder)
+            ((eq? command 'get-stream)
+             output-stream)
+            ((eq? command 'get-held-notes)
+             (holder 'get-notes))
+            ((eq? command 'status)
+             status)
+            (else (println 'looper:create/lambda: 'unknown 'command command))))))
+
+(define (looper:get-stream looper)
+  (looper 'get-stream))
+(define (looper:get-held-notes looper)
+  (looper 'get-held-notes))
+(define (looper:trigger looper)
+  (looper 'trigger))
+(define (looper:status looper)
+  (looper 'status))
+
+;; Work on conversion of recorded events to manipulable code
+;; Input: event list (as taken from recorder object) - events + their times
+;; Output: list of (event-time . note . duration)
+
+;; Need to convert to 
+;; (beat . note . duration)
+
+;; Assuming quantised values to 1/4 beats
+;; Then plot underlying substrate:
+;; _ _ _ _
+;; ->
+;; 60 | | 70 | _ _ 80
+;; NB monophonic - have to terminate previous note when next note sounds
+;; Alternative would be to have separate list of durations...
+
+;; (60 _ _ _ 62 64 60 _)
+;; (3/4 _ _ _ 4/4 1/4 2/4)
+
+
+;; event-list->note-duration-list: event-list -> note-duration-list
+  ;; iterate through the event-list
+  ;; If current event is note-on:
+  ;; Use assoq to find next matching note event
+  ;; Work out duration by subtraction
+  ;; If current event is note-off:
+  ;; Continue
+  ;; Return list of pairs of notes + their durations
+(define (event-list->note-duration-list event-list)
+  (define note-type-pairs (map (lambda (event)
+                                 (let ((event-time (car event))
+                                       (event-type (cadr event))
+                                       (event-note (cadddr event)))
+                                   (if (or (= event-type *midi-note-on*)
+                                           (= event-type *midi-note-off*))
+                                     (cons event-note (cons event-type event-time))
+                                     '()))) event-list))
+  (set! note-type-pairs (filter (lambda (pair)
+                                  (not (null? pair))) note-type-pairs)) ;; Remove control change events etc.
+  (let loop ((remaining-events note-type-pairs)
+             (return-list '()))
+    (if (null? remaining-events)
+      (reverse return-list)
+      (let* ((event (car remaining-events))
+             (note (car event))
+             (event-type (cadr event))
+             (event-time (cddr event)))
+          (let ((release-event (assoc note (cdr remaining-events))))
+            (loop (cdr remaining-events)
+                  (if (= event-type *midi-note-on*) ;; If it's a note-on event, append details...
+                    (cons (cons event-time (cons note (- (cddr (if release-event
+                                                                 release-event
+                                                                 (tail remaining-events))) event-time)))
+                          return-list)
+                    return-list)))))))  ;; Otherwise just loop & ignore
+
+;; Helper function to convert output of above function into sub-beat times and durations
+;; (from absolute time values)
+
+;; TODO: Is the subtraction of intial-beat still justified given that the recorder now normalizes the start-time values?
+;; possibly not - please investigate and update code listing in report
+
+(define (time-note-duration->beat-note-pair event-list quantisation-factor)
+  (define initial-beat (*metro* 'beat-at-time (caar event-list)))
+  (map (lambda (event)
+         (list (real->integer (* quantisation-factor (- (*metro* 'beat-at-time (car event)) initial-beat)))
+               (cadr event)
+               (real->integer (* quantisation-factor (*metro* 'beat-at-time (cddr event))))))
+       event-list))
+
+;; Put it all together
+;; Produce a pattern-list expression given a recorder-generated
+;; list of MIDI events
+
+(define (event-list->pattern-list event-list quantisation-factor)
+  (define beat-note-pairs (time-note-duration->beat-note-pair
+                            (event-list->note-duration-list event-list) quantisation-factor))
+  (define pattern-list '())
+  ;; Need to look for "gaps" and insert silences appropriately (_s)
+  (let loop ((remaining-events beat-note-pairs))
+    (let* ((event (car remaining-events))
+           (note (cadr event))
+           (note-start-beat (car event))
+           (note-duration (caddr event))
+           (event-finish-beat (+ note-start-beat note-duration)))
+      (if (null? (cdr remaining-events))
+        (set! pattern-list (append pattern-list     ;; Reached end of list -> will return pattern-list
+                                   (cons note (nof (- note-duration 1) '|))))
+        (let* ((next-event (cadr remaining-events))
+               (next-event-start-beat (car next-event))
+               (beats-til-next-note (- next-event-start-beat note-start-beat))
+               (spacing-length (- next-event-start-beat event-finish-beat)))
+          (set! pattern-list (append pattern-list
+                                     (cons note (nof (- (min note-duration beats-til-next-note) 1) '|))))
+          (if (> spacing-length 0)
+            ;; Need to insert silence(s)
+            (set! pattern-list (append pattern-list (nof spacing-length '_))))
+          (loop (cdr remaining-events))))))
+  ;; Pad the produced pattern list so that it ends on a complete beat
+  ;; i.e. total sub-beat count should be divisible by quantisation-factor without remainder
+  (let ((padding-required (- (closest-multiple-above (length pattern-list) quantisation-factor)
+                             (length pattern-list))))
+    (set! pattern-list (append pattern-list (nof padding-required '_)))))
+
+(define (recorder->pattern-expr rec)
+  (define quantisation-factor (/ 1 (recorder:get-precision rec)))
+  (define pattern-list (event-list->pattern-list (recorder:get-events rec) quantisation-factor))
+  `(:> _pattern_name_ ,(real->integer (/ (length pattern-list) quantisation-factor)) 0
+       (mplay midi-out @1 80 dur 0)
+       (quote ,pattern-list)))
+
+;; Tests
+
+(sys:load "tom/test.xtm")
+
+;; Test holders
+
+;; Helper functions to simulate MIDI note on and off events
+
+(define (send-midi-notes stream type . notes)
+  (for-each (lambda (note)
+              (stream:send stream type 0 note 127))
+            notes))
+
+(define (depress-notes stream . notes)
+  (apply send-midi-notes stream *midi-note-on* notes))
+(define (release-notes stream . notes)
+  (apply send-midi-notes stream *midi-note-off* notes))
+
+(test:define-tests
+  'holder
+  input-stream <- (stream:new)
+  holder <- (holder:new input-stream)
+  (holder:get-notes holder) -> '()
+  _ <- (depress-notes input-stream 60 62 65)
+  (holder:get-notes holder) -> '(60 62 65)
+  _ <- (depress-notes input-stream 65 62 60)
+  (holder:get-notes holder) -> '(60 62 65)      ;; Check for duplication errors
+  _ <- (depress-notes input-stream 42)
+  (holder:get-notes holder) -> '(42 60 62 65)
+  _ <- (release-notes input-stream 60 62 65)
+  (holder:get-notes holder) -> '(42)
+  _ <- (holder:purge-notes! holder)
+  (holder:get-notes holder) -> '()              ;; Test purging notes list
+  input-stream-two <- (stream:new)
+  _ <- (holder:set-input-stream! input-stream-two)
+  _ <- (depress-notes input-stream 40 42 44)
+  (holder:get-notes holder) -> '()              ;; Check de-registration of previous stream
+  _ <- (depress-notes input-stream-two 40 42 44)
+  (holder:get-notes holder) -> '(40 42 44)      ;; Check registration to new stream
+)
+
+(test:define-tests
+  'recorder
+  input-stream <- (stream:new)
+  recorder <- (recorder:new)
+  _ <- (recorder:set-input-stream! recorder input-stream)
+  output-stream <- (recorder:get-playback-stream recorder)
+  _ <- (recorder:start-recording! recorder)
+  _ <- (depress-notes stream 60 64 67)
+  _ <- (sys:sleep *second*)
+  _ <- (release-notes stream 60 64 670)
+  _ <- (sys:sleep *second*)
+  _ <- (recorder:stop! recorder)
+  _ <- (recorder:play! recorder)
+  (stream:await output-stream) -> '(*midi-note-on* 0 60 127)
+  (stream:await output-stream) -> '(*midi-note-on* 0 64 127)
+  (stream:await output-stream) -> '(*midi-note-on* 0 67 127)
+)

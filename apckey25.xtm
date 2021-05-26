@@ -1,0 +1,90 @@
+;; Bindings useful for interacting with APC Key-25
+;; Midi controller
+
+;; Author: Thomas Baggaley
+;; 29/5/20
+
+;; Grid runs from 0 - 39
+(define *apc-channel* 0)
+
+(define *apc-grid-start* 0)
+(define *apc-grid-end* 39)
+
+(define (apc25:grid-at-coords col row)
+  (+ (* row 8) col))
+
+;; Other light-up buttons
+(define *apc-up* 64)
+(define *apc-down* 65)
+(define *apc-left* 66)
+(define *apc-right* 67)
+(define *apc-volume* 68)
+(define *apc-pan* 69)
+(define *apc-send* 70)
+(define *apc-device* 71)
+(define *apc-clip-stop* 82)
+(define *apc-solo* 83)
+(define *apc-rec-arm* 84)
+(define *apc-mute* 85)
+(define *apc-select* 86)
+(define *apc-stop-all-clips* 81)
+(define *apc-play-pause* 91)
+(define *apc-rec* 93)
+(define *apc-shift* 98)
+
+; Values for lights (generic)
+(define *apc-off* 0)
+(define *apc-on* 1)
+(define *apc-blink* 2)
+
+; Values for lights in grid (more options)
+(define *apc-green-solid* 1)
+(define *apc-green-blink* 2)
+(define *apc-red-solid* 3)
+(define *apc-red-blink* 4)
+(define *apc-amber-solid* 5)
+(define *apc-amber-blink* 6)
+
+(define *apc-output* (midi:create-port 'out "Extempore APC25 Control"))
+
+; Helper functions for use with lights
+(define (apc25:set-light! button-id colour)
+  (midi:send *apc-output* *midi-note-on* 0 button-id colour))
+
+;; On startup, clear all lights
+(dotimes (i 127)
+  (apc25:set-light! i 0))
+
+(define-macro (apc25:on-keypress midi-stream note expr)
+  `(midi:on-keypress ,midi-stream 0 ,note ,expr))
+
+;; Helper for quickly setting up loops attached to APC25 pads
+(define-macro (apc25:setup-looper key input-stream output-stream output-channel)
+  (let ((looper-name (string->symbol (string-append "looper_key_" (number->string key)))))
+  `(begin
+     (define ,looper-name (looper:new (stream:filter (lambda (type chan a b)
+                                                          (not (and (= chan 0)
+                                                                    (not (= type *midi-cc*)))))
+                                                        ,input-stream)
+                                         ,output-stream ,output-channel))
+     (apc25:on-keypress ,input-stream ,key
+                        (begin
+                          (looper:trigger ,looper-name)
+                          (let ((status (looper:status ,looper-name)))
+                            (cond ((eq? status 'stopped)
+                                   (apc25:set-light! ,key *apc-amber-solid*))
+                                  ((eq? status 'recording)
+                                   (apc25:set-light! ,key *apc-red-solid*))
+                                  ((eq? status 'playing)
+                                   (apc25:set-light! ,key *apc-green-solid*))))))
+     ;; Start light as amber, flashing, signalling looper in empty state
+     (apc25:set-light! ,key *apc-amber-blink*)
+     ,looper-name)))
+
+
+;; Flash "Device" button in time with current metronome settings
+;; to help with timing of loops / controls etc.
+;; Use pattern language, why not
+(:> *apc-tempo-flash* 1 0 (apc25:set-light! *apc-device* @1) '(((*apc-on* *apc-off*))))
+
+(:> metro 1 0 (play kit @1 40 dur) '(50))

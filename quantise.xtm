@@ -1,0 +1,67 @@
+;; Useful functions for getting
+;; closest multiples of one number higher/lower than
+;; another:
+
+(define (closest-multiple-above base number)
+  (* (ceiling (/ base number)) number))
+(define (closest-multiple-below base number)
+  (* (floor (/ base number)) number))
+
+;; Round a number to the cloest multiple of argument "precision"
+;; e.g.
+;; (round-to-closest 25 0.28) --> 25.2
+
+(define (round-to-closest number precision)
+  (let ((hi-limit (closest-multiple-above number precision))
+        (lo-limit (closest-multiple-below number precision)))
+    (if (< (- number hi-limit)
+           (- number lo-limit))
+      hi-limit
+      lo-limit)))
+
+;; time-quantise: sample-time precision -> adjusted-sample-time
+;; Given a time in samples and a precision,
+;; return a new adjusted sample-time quantised to occur at a 
+;; multiple in beats of precision
+;; e.g. assuming sample rate of 48kHz
+;; (time-quantise 49233 1/4) -> 54000.00
+;; The new value is certain to take place on a quarter beat per *metro*
+
+(define (time-quantise sample-time precision)
+  (let* ((beat-at-sample-time (*metro* 'beat-at-time sample-time))
+         (sample-adjustment (*metro* (- (round-to-closest beat-at-sample-time precision) beat-at-sample-time))))
+    (+ sample-time sample-adjustment)))
+
+;; Get fractional part of a number
+(define (frac number)
+  (modulo number 1))
+
+;; Helper function to get next beat time
+(define (get-next-beat-after time)
+  (+ time (*metro* (- 1 (frac (*metro* 'beat-at-time time))))))
+
+(define (get-first-beat-before time)
+  (let ((beat-after-time (get-next-beat-after time)))
+    (if (= beat-after-time time)
+      ;; Already on the beat
+      time
+      ;; Otherwise get the previous beat
+      (- beat-after-time (*metro* 1)))))
+
+(define (get-next-beat-time)
+  (get-next-beat-after (now)))
+
+(define (get-previous-beat-time)
+  (get-first-beat-before (now)))
+
+;; Tests
+
+(test:define-tests
+  'quantise
+  error-with-precision <- (lambda (precision)
+                            (modulo (*metro* 'beat-at-time (time-quantise (now) precision))
+                                    precision))
+  (error-with-precision 0.5) -> 0
+  (error-with-precision 0.25) -> 0
+  (error-with-precision 0.1) -> 0
+  (error-with-precision 1/3) -> 0)

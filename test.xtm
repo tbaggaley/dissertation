@@ -1,0 +1,103 @@
+;; test.xtm
+;; Scheme testing framework
+;; Provides a simple and concise means of testing Scheme code,
+;; defining tests, running them and generating a report
+;;
+;; Uses special syntax, i.e:
+;;
+;; form <- expr             ;; binds expr to form
+;; expr1 -> expr2           ;; defines a test which checks if expr1 is equal? to expr2
+;;
+;; For example, usage:
+;;
+;; (tests:define-tests 'demo-test
+;;    my-var <- 42              ;; (define my-var 42)
+;;    my-var -> 42              ;; assert that my-var should be 42
+;;    (+ my-var 1) -> 43)       ;; assert that (+ my-var 1) should be 43
+;;
+;;  This test set can then be executed by running
+;;  (tests:run-tests 'demo-test)
+;;
+;;  Author: Thomas Baggaley <baggaleyto@cardiff.ac.uk>
+
+
+;; utils.xtm provides list-group
+(sys:load "tom/utils.xtm")
+
+(define (test:get-fn-from-name name)
+  (string->symbol (string-append "test:macrogen:" (symbol->string name))))
+
+(define (define-tests-helper group)
+  ;; Group consists of (expr direction expr)
+  (let ((first (car group))
+        (direction (cadr group))
+        (last (caddr group)))
+    (cond ((eq? direction '<-)
+           `(define ,first ,last))
+          ((eq? direction '->)
+           `(let ((passed? (equal? (eval ,first) (eval ,last))))
+              (set! total-tests (+ 1 total-tests))
+              (if passed? (set! tests-passed (+ 1 tests-passed)))
+              (print (quote ,first) '-> (quote ,last) ': " ")
+              (print-with-colors (if passed? 'green 'red) 'default #t
+                                 (println (if passed? 'PASSED 'FAILED)))))
+          (else 'unknown-direction))))
+
+(define-macro (test:define-tests . args)
+  (let ((title (car args))
+        (grouped-exprs (list-group (cdr args) 3)))
+    `(define ,(test:get-fn-from-name (cadr title))
+       (lambda ()
+         (let ((total-tests 0)
+               (tests-passed 0))
+           (print-with-colors 'yellow 'default #t (println 'Running 'tests 'for ,title))
+           ,(cons 'begin (map define-tests-helper grouped-exprs))
+           (println)
+           (cons total-tests tests-passed))))))
+
+(define (test:run-tests . test-names)
+  (let ((total-tests 0)
+        (total-passed 0)
+        (failing-groups '()))
+    (for-each (lambda (name)
+                (let* ((result (apply (eval (test:get-fn-from-name name))))
+                       (tests-in-group (car result))
+                       (tests-passed-in-group (cdr result)))
+                  (set! total-tests (+ total-tests tests-in-group))
+                  (set! total-passed (+ total-passed tests-passed-in-group))
+                  (if (not (= tests-in-group tests-passed-in-group))
+                    (set! failing-groups (cons name failing-groups)))))
+              test-names)
+    (print-with-colors 'yellow 'default #t (begin
+                                             (println 'Testing 'complete)
+                                             (println total-passed 'out 'of total-tests 'successful)))
+    (println)
+    (if (not (null? failing-groups))
+      (begin
+        (print-with-colors 'red 'default #t
+                           (apply println 'The 'following 'units 'have 'failing 'tests: failing-groups))
+        (println)
+        #f)
+      #t)))
+
+;; Play with testing of MIDI code/streams
+
+;(define input-stream (stream:new))
+;(define output-stream (stream:new))
+;
+;(define holder (holder:new input-stream))
+;
+;(for-each (lambda (event)
+;            (stream:send input-stream event))
+;          (for-each (lambda (note))
+;                    (note-on-event note 127)
+;                    '(60 62 65)))
+
+(define (samples->ms time)
+  (real->integer (/ time 48)))
+
+(define (time expr)
+  (let ((start-time (now))
+        (result (eval expr)))
+    (println expr 'executed 'in (samples->ms (- (now) start-time)) 'ms)
+    result))

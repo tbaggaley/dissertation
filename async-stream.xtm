@@ -1,0 +1,131 @@
+(define (stream:new)
+  (let ((callbacks '()))
+    (lambda (command . args)
+      (cond ((eq? command 'send)
+             (for-each (lambda (callback-fn)
+                           (apply (if (symbol? callback-fn) (eval callback-fn) callback-fn) args))
+                       callbacks))
+            ((eq? command 'register-callback!)
+             (set! callbacks (cons (car args) callbacks)))
+            ((eq? command 'remove-callback!)
+             (set! callbacks (filter (lambda (callback-fn)
+                                       (not (eq? callback-fn (car args))))
+                                     callbacks)))
+            ((eq? command 'purge-callbacks!)
+             (set! callbacks '()))
+            ((eq? command 'get-callbacks)
+             callbacks)
+            (else
+              (println 'stream:new: 'unknown 'command: command))))))
+
+;; Helper functions
+
+(define (stream:send stream . data)
+  (apply stream 'send data))
+(define (stream:register-callback! stream fn)
+  (stream 'register-callback! fn))
+(define (stream:remove-callback! stream fn)
+  (stream 'remove-callback! fn))
+(define (stream:purge-callbacks! stream)
+  (stream 'purge-callbacks!))
+
+;; Higher-level, asynchronous stream functions
+;; Allow writing in synchronous way (i.e. "await" syntax)
+;; while being non-blocking & playing nice with Extempore's
+;; non-preemptive, single-threaded scheduler
+
+(define (stream:await stream)
+  (call/cc (lambda (current-continuation)
+    (letrec ((callback-fn (lambda args
+                            (callback (now)
+                                      (lambda () 
+                                        (stream:remove-callback! stream callback-fn)
+                                        (apply current-continuation args))))))
+      (stream:register-callback! stream callback-fn)
+      (*sys:toplevel-continuation* 'awaiting)))))
+
+(define (stream:for-each fn stream)
+  (stream:register-callback! stream fn))
+
+(define (stream:map fn stream)
+  (let ((output-stream (stream:new)))
+    (stream:register-callback! stream (lambda data
+                                        (stream:send output-stream (apply fn data))))
+    output-stream))
+
+(define (stream:filter predicate stream)
+  (let ((output-stream (stream:new)))
+    (stream:for-each (lambda data
+                       (if (apply predicate data)
+                         (apply stream:send output-stream data)))
+                     stream)
+    output-stream))
+
+(define (stream:merge . streams)
+  (let ((output-stream (stream:new)))
+    (for-each (lambda (stream)
+                (stream:for-each (lambda data
+                                   (apply stream:send output-stream data))))
+              streams)
+    output-stream))
+
+;; stream:send-at -> utility function used to schedule sending
+;; so that stream:await may be used in testing code
+(define (stream:send-at time stream . data)
+  (callback time (lambda () (apply stream:send stream data))))
+
+;; Wrapper for the above for using millisecond delays
+(define (stream:send-after-ms ms stream . data)
+  (apply stream:send-at (+ (now) (* (/ *second* 1000) ms)) stream data))
+
+;; Tests
+
+(sys:load "tom/test.xtm")
+
+(test:define-tests
+  'stream:await
+  stream <- (stream:new)
+  _ <- (stream:send-after-ms 0 stream 42)
+  _ <- (stream:send-after-ms 100 stream 100)
+  (stream:await stream) -> 42
+  (stream:await stream) -> 100)
+
+(test:define-tests
+  'stream:map
+  stream <- (stream:new)
+  stream* <- (stream:map (lambda (x) (* x 2)) stream)
+  _ <- (stream:send-after-ms 0 stream 42)
+  _ <- (stream:send-after-ms 100 stream 100)
+  (stream:await stream*) -> 84
+  (stream:await stream*) -> 200)
+
+(test:define-tests
+  'stream:filter
+  stream <- (stream:new)
+  evens <- (stream:filter even? stream)
+  _ <- (dotimes (i 5) (stream:send-after-ms (* i 50) stream i))
+  (stream:await evens) -> 0
+  (stream:await evens) -> 2
+  (stream:await evens) -> 4)
+
+(test:define-tests
+  'stream:for-each
+  ;; Check that a procedure is called once per stream datum
+  stream <- (stream:new)
+  counter <- 0
+  _ <- (stream:for-each (lambda _ (set! counter (+ 1 counter))) stream)
+  _ <- (stream:send stream 42)
+  _ <- (stream:send stream 1000)
+  counter -> 2)
+
+(test:define-tests
+  'stream:merge
+  stream1 <- (stream:new)
+  stream2 <- (stream:new)
+  stream <- (stream:merge stream1 stream2)
+  _ <- (stream:send-at-ms 0 stream1 42)
+  _ <- (stream:send-at-ms 50 stream2 100)
+  (stream:await stream) -> 42
+  (stream:await stream) -> 100)
+
+;; (test:run-tests 'stream:await 'stream:map 'stream:filter 'stream:for-each 'stream:merge)
