@@ -1,4 +1,4 @@
-# Source code for dissertation project: Extempore & MIDI control
+# Extempore & MIDI control
 
 ## Using the files with Extempore
 
